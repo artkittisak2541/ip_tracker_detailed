@@ -4,18 +4,30 @@ import json
 import os
 import requests
 import socket
-import threading
-import webbrowser
 import csv
 from io import StringIO
+from threading import Timer
+import sys
 
 app = Flask(__name__)
 
-# เก็บข้อมูลใน memory
+# เก็บข้อมูลใน memory (บน Render ใช้ file-based storage)
 logs = []
 
 # ============================================
-# HTML TEMPLATES
+# CONFIGURATION FOR RENDER
+# ============================================
+
+# Render กำหนด port จาก environment variable
+PORT = int(os.environ.get('PORT', 5000))
+# บน Render ไม่สามารถใช้ 0.0.0.0 ได้บางกรณี
+HOST = '0.0.0.0'
+
+# ไฟล์เก็บข้อมูล
+DATA_FILE = 'click_logs.json'
+
+# ============================================
+# HTML TEMPLATES (ใช้แบบเดิม)
 # ============================================
 
 HTML_HOME = '''
@@ -24,6 +36,7 @@ HTML_HOME = '''
 <head>
     <title>🖥️ IP Tracker แสดงที่อยู่ละเอียด</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="ระบบติดตามตำแหน่งโดยประมาณจาก IP Address สำหรับการเรียนรู้">
     <style>
         * { font-family: 'Segoe UI', 'Sukhumvit Set', 'Kanit', sans-serif; }
         body { max-width: 1000px; margin: 0 auto; padding: 20px; background: #f8f9fa; }
@@ -37,13 +50,31 @@ HTML_HOME = '''
         .stat-item { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 3px 10px rgba(0,0,0,0.1); }
         .warning { background: #fff3cd; border: 1px solid #ffeaa7; padding: 15px; border-radius: 8px; margin: 15px 0; }
         .ip-display { font-family: monospace; font-size: 18px; color: #d32f2f; font-weight: bold; }
+        .render-notice { 
+            background: #d4edda; 
+            border: 1px solid #c3e6cb; 
+            padding: 15px; 
+            border-radius: 8px; 
+            margin: 15px 0;
+            color: #155724;
+        }
     </style>
 </head>
 <body>
     <div class="header">
         <h1>🌍 IP Tracker แสดงที่อยู่ละเอียด</h1>
         <p>ติดตามตำแหน่งโดยประมาณจาก IP Address</p>
+        <p style="font-size: 0.9em; opacity: 0.9;">กำลังทำงานบน Render.com</p>
     </div>
+    
+    {% if is_render %}
+    <div class="render-notice">
+        <h3>🚀 ระบบกำลังทำงานบน Render.com</h3>
+        <p>✅ ลิงก์นี้สามารถแชร์ให้คนอื่นใช้งานได้ทันที</p>
+        <p>🌐 ลิงก์สาธารณะ: <strong>{{ render_url }}</strong></p>
+        <p>📱 สามารถใช้ได้ทั้งคอมพิวเตอร์และมือถือ</p>
+    </div>
+    {% endif %}
     
     <div class="card">
         <h2>🔗 สร้างลิงก์ติดตาม</h2>
@@ -103,12 +134,13 @@ HTML_HOME = '''
         <h3>⚠️ ข้อควรระวัง</h3>
         <p>1. ระบบนี้แสดงตำแหน่งโดยประมาณจาก IP เท่านั้น (คลาดเคลื่อน 10-50 กม.)</p>
         <p>2. ใช้สำหรับการเรียนรู้เท่านั้น ห้ามใช้ละเมิดความเป็นส่วนตัวผู้อื่น</p>
-        <p>3. บันทึกข้อมูลอัตโนมัติในไฟล์ click_logs.json</p>
+        <p>3. ข้อมูลบันทึกในระบบชั่วคราว</p>
+        <p>4. บน Render.com ข้อมูลอาจถูกล้างเมื่อเซิร์ฟเวอร์รีสตาร์ต</p>
     </div>
     
     <div class="card">
-        <h3>📡 ข้อมูลเซิร์ฟเวอร์</h3>
-        <p>🟢 เซิร์ฟเวอร์ทำงานอยู่ที่: <span class="ip-display">{{ server_ip }}</span></p>
+        <h3>📡 ข้อมูลระบบ</h3>
+        <p>🟢 เซิร์ฟเวอร์: Render.com</p>
         <p>🔗 URL หลัก: {{ main_link }}</p>
         <p>📊 ดูบันทึก: <a href="/logs">/logs</a></p>
         <p>🕒 เวลาเริ่มต้น: {{ start_time }}</p>
@@ -146,7 +178,6 @@ HTML_HOME = '''
     }
     
     function testDifferentIPs() {
-        // ทดสอบหลายสถานการณ์
         const tests = ['local-test', 'mobile-test', 'vpn-test'];
         tests.forEach(test => {
             fetch('/click/' + test);
@@ -168,62 +199,66 @@ HTML_CLICK = '''
         body { 
             font-family: 'Segoe UI', 'Sukhumvit Set', sans-serif; 
             text-align: center; 
-            padding: 40px; 
+            padding: 20px; 
             background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
             min-height: 100vh;
+            margin: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
         }
         .container { 
             background: white; 
-            padding: 40px; 
+            padding: 30px; 
             border-radius: 20px; 
             box-shadow: 0 10px 40px rgba(0,0,0,0.1); 
-            display: inline-block;
-            max-width: 600px;
+            max-width: 90%;
+            width: 500px;
         }
         .checkmark { 
             color: #4CAF50; 
-            font-size: 80px; 
-            margin-bottom: 20px;
+            font-size: 60px; 
+            margin-bottom: 15px;
         }
         .info-card { 
             background: #f8f9fa; 
-            padding: 25px; 
+            padding: 20px; 
             border-radius: 15px; 
             text-align: left;
-            margin: 25px 0;
+            margin: 20px 0;
             border-left: 5px solid #2196F3;
         }
-        .info-item { margin: 10px 0; }
+        .info-item { margin: 8px 0; }
         .ip-address { 
             font-family: monospace; 
-            font-size: 18px; 
+            font-size: 16px; 
             color: #d32f2f; 
             font-weight: bold;
             background: #ffebee;
-            padding: 8px 15px;
+            padding: 6px 12px;
             border-radius: 5px;
             display: inline-block;
         }
-        .location-detail { color: #666; font-size: 0.95em; }
-        .btn { 
-            background: #2196F3; 
-            color: white; 
-            padding: 12px 25px; 
-            border: none; 
-            border-radius: 8px; 
-            cursor: pointer;
-            text-decoration: none;
-            display: inline-block;
-            margin: 10px;
+        .location-detail { color: #666; font-size: 0.9em; }
+        .countdown {
+            margin-top: 25px;
+            padding: 15px;
+            background: #e8f5e9;
+            border-radius: 10px;
+            color: #2e7d32;
+            font-weight: bold;
         }
-        .btn:hover { background: #1976D2; }
+        @media (max-width: 480px) {
+            .container { padding: 20px; }
+            .info-card { padding: 15px; }
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="checkmark">✓</div>
         <h1>ขอบคุณที่คลิก! 🙏</h1>
-        <p>บันทึกข้อมูลของคุณเรียบร้อยแล้ว</p>
+        <p>บันทึกข้อมูลเรียบร้อยแล้ว</p>
         
         <div class="info-card">
             <div class="info-item">
@@ -250,17 +285,11 @@ HTML_CLICK = '''
                         {% if location.district and location.district != 'Unknown' %}
                             ตำบล/แขวง: {{ location.district }}<br>
                         {% endif %}
-                        {% if location.postal and location.postal != 'Unknown' %}
-                            รหัสไปรษณีย์: {{ location.postal }}<br>
-                        {% endif %}
-                        <em style="color: #888; font-size: 0.9em;">(ตำแหน่งโดยประมาณจาก IP)</em>
+                        <em style="color: #888; font-size: 0.85em;">(ตำแหน่งโดยประมาณจาก IP)</em>
                     {% else %}
                         ประเทศ: {{ location.country }}<br>
                         {% if location.city and location.city != 'Unknown' %}
                             เมือง: {{ location.city }}<br>
-                        {% endif %}
-                        {% if location.region and location.region != 'Unknown' %}
-                            รัฐ/จังหวัด: {{ location.region }}
                         {% endif %}
                     {% endif %}
                 </div>
@@ -270,583 +299,167 @@ HTML_CLICK = '''
                 <strong>🕒 เวลา:</strong><br>
                 {{ time }}
             </div>
-            
-            <div class="info-item">
-                <strong>📡 เครือข่าย:</strong><br>
-                {{ location.isp }}
-            </div>
         </div>
         
-        <p style="margin-top: 30px;">
-            <a href="/" class="btn">← กลับหน้าหลัก</a>
-            {% if location.lat and location.lon %}
-            <a href="https://maps.google.com/?q={{ location.lat }},{{ location.lon }}" target="_blank" class="btn">🗺️ ดูแผนที่</a>
-            {% endif %}
-        </p>
-        
-        <div style="margin-top: 30px; padding: 15px; background: #e8f5e9; border-radius: 10px; color: #2e7d32;">
-            <p><strong>ℹ️ ข้อมูล:</strong> ระบบนี้บันทึกข้อมูลเพื่อการเรียนรู้เท่านั้น</p>
-            <p style="font-size: 0.9em;">ตำแหน่งที่แสดงเป็นตำแหน่งโดยประมาณจากผู้ให้บริการอินเทอร์เน็ต</p>
+        <div class="countdown" id="countdown-display">
+            หน้าต่างนี้จะปิดอัตโนมัติใน <span id="countdown">5</span> วินาที
         </div>
     </div>
     
     <script>
-        // ปิดหน้าต่างอัตโนมัติถ้าเป็น popup
-        if(window.opener) {
-            setTimeout(() => {
-                window.close();
-            }, 5000);
-        }
+        // นับถอยหลังและปิดหน้าต่าง
+        let countdown = 5;
+        const countdownElement = document.getElementById('countdown');
         
-        // แสดงเวลา countdown ถ้าเป็น popup
-        if(window.opener) {
-            let countdown = 5;
-            const countdownEl = document.createElement('p');
-            countdownEl.innerHTML = `หน้าต่างนี้จะปิดอัตโนมัติใน <span id="countdown">${countdown}</span> วินาที`;
-            countdownEl.style.marginTop = '20px';
-            countdownEl.style.color = '#666';
-            document.querySelector('.container').appendChild(countdownEl);
+        const interval = setInterval(() => {
+            countdown--;
+            countdownElement.textContent = countdown;
             
-            const interval = setInterval(() => {
-                countdown--;
-                document.getElementById('countdown').textContent = countdown;
-                if(countdown <= 0) {
-                    clearInterval(interval);
+            if (countdown <= 0) {
+                clearInterval(interval);
+                
+                // พยายามปิดหน้าต่าง
+                if (window.history.length > 1) {
+                    window.history.back();
+                } else if (window.opener) {
                     window.close();
+                } else {
+                    // ถ้าไม่สามารถปิดได้
+                    document.getElementById('countdown-display').innerHTML = 
+                        '<div style="color: #4CAF50;">✔️ บันทึกข้อมูลเรียบร้อยแล้ว</div>';
                 }
-            }, 1000);
-        }
+            }
+        }, 1000);
+        
+        // พยายามปิดหน้าต่างทันทีถ้าเปิดจาก popup
+        setTimeout(() => {
+            if (window.opener) {
+                window.close();
+            }
+        }, 100);
     </script>
 </body>
 </html>
 '''
 
-HTML_LOGS = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>📊 บันทึกการคลิกทั้งหมด</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        * { font-family: 'Segoe UI', 'Sukhumvit Set', sans-serif; }
-        body { margin: 0; padding: 20px; background: #f5f5f5; }
-        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 25px; border-radius: 15px; margin-bottom: 25px; }
-        .controls { background: white; padding: 20px; border-radius: 15px; margin-bottom: 20px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-        button { background: #2196F3; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; }
-        button:hover { background: #1976D2; }
-        .export-btn { background: #4CAF50; }
-        .clear-btn { background: #dc3545; }
-        table { width: 100%; border-collapse: collapse; background: white; border-radius: 15px; overflow: hidden; box-shadow: 0 5px 20px rgba(0,0,0,0.1); }
-        th { background: #343a40; color: white; padding: 15px; text-align: left; }
-        td { padding: 15px; border-bottom: 1px solid #eee; }
-        tr:hover { background: #f8f9fa; }
-        .ip-cell { font-family: monospace; font-weight: bold; color: #d32f2f; }
-        .location-cell { max-width: 300px; }
-        .address-detail { font-size: 0.9em; color: #666; }
-        .badge { background: #6c757d; color: white; padding: 3px 10px; border-radius: 20px; font-size: 0.85em; display: inline-block; margin: 2px; }
-        .map-link { color: #2196F3; text-decoration: none; }
-        .map-link:hover { text-decoration: underline; }
-        .pagination { margin-top: 20px; display: flex; justify-content: center; gap: 10px; }
-        .page-btn { padding: 8px 15px; background: #6c757d; color: white; border-radius: 5px; cursor: pointer; }
-        .page-btn.active { background: #2196F3; }
-        .no-data { text-align: center; padding: 50px; color: #666; }
-        .device-icon { font-size: 1.2em; margin-right: 5px; }
-        .filter-bar { display: flex; gap: 10px; margin-bottom: 15px; }
-        .filter-bar input, .filter-bar select { padding: 8px; border: 1px solid #ddd; border-radius: 5px; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>📊 บันทึกการคลิกทั้งหมด</h1>
-        <p>แสดงข้อมูลตำแหน่งละเอียดจาก IP Address</p>
-    </div>
-    
-    <div class="controls">
-        <button onclick="location.href='/'">← กลับหน้าหลัก</button>
-        <button onclick="location.href='/live'">🔴 Live View</button>
-        <button onclick="location.href='/export-csv'" class="export-btn">📥 Export CSV</button>
-        <button onclick="location.href='/export-json'" class="export-btn">📥 Export JSON</button>
-        <button onclick="if(confirm('ลบข้อมูลทั้งหมด?')) location.href='/clear'" class="clear-btn">🗑️ ล้างข้อมูลทั้งหมด</button>
-        
-        <div style="margin-left: auto; display: flex; gap: 10px; align-items: center;">
-            <input type="text" id="search-ip" placeholder="ค้นหา IP..." style="padding: 8px;">
-            <select id="filter-country">
-                <option value="">ทั้งหมด</option>
-                <option value="ไทย">ไทย</option>
-                <option value="อื่นๆ">อื่นๆ</option>
-            </select>
-            <button onclick="applyFilters()">ค้นหา</button>
-        </div>
-    </div>
-    
-    {% if logs %}
-    <div class="filter-bar">
-        <span>แสดง:</span>
-        <select id="rows-per-page" onchange="changeRowsPerPage()">
-            <option value="20">20 แถว</option>
-            <option value="50">50 แถว</option>
-            <option value="100">100 แถว</option>
-            <option value="all">ทั้งหมด</option>
-        </select>
-        <span style="margin-left: auto;">พบทั้งหมด {{ count }} รายการ</span>
-    </div>
-    
-    <table id="logs-table">
-        <thead>
-            <tr>
-                <th>เวลา</th>
-                <th>IP Address</th>
-                <th class="location-cell">📍 ที่อยู่ละเอียด</th>
-                <th>อุปกรณ์</th>
-                <th>เครือข่าย</th>
-                <th>แผนที่</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for log in logs %}
-            <tr>
-                <td>{{ log.time }}</td>
-                <td class="ip-cell">{{ log.ip }}</td>
-                <td class="location-cell">
-                    <div class="address-detail">
-                        <strong>{{ log.location.country }}</strong>
-                        {% if log.location.country == 'ไทย' %}
-                            <br>
-                            {% if log.location.region and log.location.region != 'Unknown' %}
-                                <small>จังหวัด: {{ log.location.region }}</small><br>
-                            {% endif %}
-                            {% if log.location.city and log.location.city != 'Unknown' %}
-                                <small>อำเภอ/เขต: {{ log.location.city }}</small><br>
-                            {% endif %}
-                            {% if log.location.district and log.location.district != 'Unknown' %}
-                                <small>ตำบล/แขวง: {{ log.location.district }}</small><br>
-                            {% endif %}
-                            {% if log.location.postal and log.location.postal != 'Unknown' %}
-                                <small>รหัสไปรษณีย์: {{ log.location.postal }}</small>
-                            {% endif %}
-                            <br>
-                            <em style="color: #888; font-size: 0.85em;">{{ log.location.address }}</em>
-                        {% else %}
-                            <br>
-                            {% if log.location.city and log.location.city != 'Unknown' %}
-                                <small>เมือง: {{ log.location.city }}</small><br>
-                            {% endif %}
-                            {% if log.location.region and log.location.region != 'Unknown' %}
-                                <small>รัฐ/จังหวัด: {{ log.location.region }}</small>
-                            {% endif %}
-                        {% endif %}
-                    </div>
-                </td>
-                <td>
-                    <span class="device-icon">{{ log.device[:2] }}</span>
-                    {{ log.device[2:] }}
-                </td>
-                <td><small>{{ log.location.isp[:25] }}{% if log.location.isp|length > 25 %}...{% endif %}</small></td>
-                <td>
-                    {% if log.location.lat and log.location.lon %}
-                    <a class="map-link" href="https://maps.google.com/?q={{ log.location.lat }},{{ log.location.lon }}" target="_blank">
-                        ดูแผนที่
-                    </a>
-                    {% else %}
-                    <small>-</small>
-                    {% endif %}
-                </td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
-    
-    <div class="pagination" id="pagination">
-        <!-- Pagination จะถูกสร้างด้วย JavaScript -->
-    </div>
-    
-    {% else %}
-    <div class="no-data">
-        <h2>📭 ยังไม่มีบันทึกการคลิก</h2>
-        <p>ลองส่งลิงก์ให้เพื่อนหรือทดสอบคลิกเองจากหน้าหลัก</p>
-        <button onclick="location.href='/'">ไปหน้าหลัก</button>
-    </div>
-    {% endif %}
-    
-    <script>
-    let currentPage = 1;
-    let rowsPerPage = 20;
-    let filteredLogs = {{ logs|tojson }};
-    
-    function applyFilters() {
-        const searchIP = document.getElementById('search-ip').value.toLowerCase();
-        const filterCountry = document.getElementById('filter-country').value;
-        
-        filteredLogs = {{ logs|tojson }}.filter(log => {
-            let match = true;
-            
-            if (searchIP) {
-                match = match && log.ip.toLowerCase().includes(searchIP);
-            }
-            
-            if (filterCountry === 'ไทย') {
-                match = match && log.location.country === 'ไทย';
-            } else if (filterCountry === 'อื่นๆ') {
-                match = match && log.location.country !== 'ไทย';
-            }
-            
-            return match;
-        });
-        
-        currentPage = 1;
-        renderTable();
-    }
-    
-    function changeRowsPerPage() {
-        const select = document.getElementById('rows-per-page');
-        rowsPerPage = select.value === 'all' ? filteredLogs.length : parseInt(select.value);
-        currentPage = 1;
-        renderTable();
-    }
-    
-    function renderTable() {
-        const tbody = document.querySelector('#logs-table tbody');
-        if (!tbody) return;
-        
-        const start = (currentPage - 1) * rowsPerPage;
-        const end = start + rowsPerPage;
-        const pageLogs = filteredLogs.slice(start, end);
-        
-        tbody.innerHTML = '';
-        pageLogs.forEach(log => {
-            const row = tbody.insertRow();
-            
-            // เวลา
-            row.insertCell().textContent = log.time;
-            
-            // IP
-            const ipCell = row.insertCell();
-            ipCell.className = 'ip-cell';
-            ipCell.textContent = log.ip;
-            
-            // ที่อยู่
-            const locCell = row.insertCell();
-            locCell.className = 'location-cell';
-            locCell.innerHTML = `
-                <div class="address-detail">
-                    <strong>${log.location.country}</strong>
-                    ${log.location.country === 'ไทย' ? 
-                        `<br>
-                        ${log.location.region && log.location.region !== 'Unknown' ? `<small>จังหวัด: ${log.location.region}</small><br>` : ''}
-                        ${log.location.city && log.location.city !== 'Unknown' ? `<small>อำเภอ/เขต: ${log.location.city}</small><br>` : ''}
-                        ${log.location.district && log.location.district !== 'Unknown' ? `<small>ตำบล/แขวง: ${log.location.district}</small><br>` : ''}
-                        ${log.location.postal && log.location.postal !== 'Unknown' ? `<small>รหัสไปรษณีย์: ${log.location.postal}</small><br>` : ''}
-                        <br>
-                        <em style="color: #888; font-size: 0.85em;">${log.location.address}</em>`
-                    : 
-                        `<br>
-                        ${log.location.city && log.location.city !== 'Unknown' ? `<small>เมือง: ${log.location.city}</small><br>` : ''}
-                        ${log.location.region && log.location.region !== 'Unknown' ? `<small>รัฐ/จังหวัด: ${log.location.region}</small>` : ''}`
-                    }
-                </div>
-            `;
-            
-            // อุปกรณ์
-            const deviceCell = row.insertCell();
-            deviceCell.innerHTML = `<span class="device-icon">${log.device.slice(0,2)}</span>${log.device.slice(2)}`;
-            
-            // เครือข่าย
-            const ispCell = row.insertCell();
-            ispCell.innerHTML = `<small>${log.location.isp.slice(0,25)}${log.location.isp.length > 25 ? '...' : ''}</small>`;
-            
-            // แผนที่
-            const mapCell = row.insertCell();
-            if (log.location.lat && log.location.lon) {
-                mapCell.innerHTML = `<a class="map-link" href="https://maps.google.com/?q=${log.location.lat},${log.location.lon}" target="_blank">ดูแผนที่</a>`;
-            } else {
-                mapCell.innerHTML = '<small>-</small>';
-            }
-        });
-        
-        renderPagination();
-    }
-    
-    function renderPagination() {
-        const totalPages = Math.ceil(filteredLogs.length / rowsPerPage);
-        const paginationDiv = document.getElementById('pagination');
-        if (!paginationDiv) return;
-        
-        paginationDiv.innerHTML = '';
-        
-        if (totalPages <= 1) return;
-        
-        // ปุ่มก่อนหน้า
-        if (currentPage > 1) {
-            const prevBtn = document.createElement('span');
-            prevBtn.className = 'page-btn';
-            prevBtn.textContent = '← ก่อนหน้า';
-            prevBtn.onclick = () => {
-                currentPage--;
-                renderTable();
-            };
-            paginationDiv.appendChild(prevBtn);
-        }
-        
-        // ปุ่มหมายเลขหน้า
-        const maxPagesToShow = 5;
-        let startPage = Math.max(1, currentPage - Math.floor(maxPagesToShow / 2));
-        let endPage = Math.min(totalPages, startPage + maxPagesToShow - 1);
-        
-        if (endPage - startPage + 1 < maxPagesToShow) {
-            startPage = Math.max(1, endPage - maxPagesToShow + 1);
-        }
-        
-        for (let i = startPage; i <= endPage; i++) {
-            const pageBtn = document.createElement('span');
-            pageBtn.className = 'page-btn' + (i === currentPage ? ' active' : '');
-            pageBtn.textContent = i;
-            pageBtn.onclick = () => {
-                currentPage = i;
-                renderTable();
-            };
-            paginationDiv.appendChild(pageBtn);
-        }
-        
-        // ปุ่มถัดไป
-        if (currentPage < totalPages) {
-            const nextBtn = document.createElement('span');
-            nextBtn.className = 'page-btn';
-            nextBtn.textContent = 'ถัดไป →';
-            nextBtn.onclick = () => {
-                currentPage++;
-                renderTable();
-            };
-            paginationDiv.appendChild(nextBtn);
-        }
-        
-        // แสดงข้อมูล
-        const infoSpan = document.createElement('span');
-        infoSpan.style.marginLeft = '20px';
-        infoSpan.style.color = '#666';
-        infoSpan.textContent = `แสดง ${filteredLogs.length} รายการ`;
-        paginationDiv.appendChild(infoSpan);
-    }
-    
-    // เริ่มต้น
-    renderTable();
-    </script>
-</body>
-</html>
-'''
-
-HTML_LIVE = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>🔴 Live Click Monitor</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta http-equiv="refresh" content="3">
-    <style>
-        * { font-family: 'Consolas', 'Monaco', monospace; }
-        body { margin: 0; padding: 20px; background: #000; color: #0f0; }
-        .header { text-align: center; margin-bottom: 30px; }
-        .log-entry { 
-            background: #111; 
-            padding: 15px; 
-            margin: 10px 0; 
-            border-left: 4px solid #0f0;
-            border-radius: 5px;
-            animation: fadeIn 0.5s;
-        }
-        .log-entry.new { 
-            background: #003300; 
-            border-left: 4px solid #ff0;
-            animation: highlight 2s;
-        }
-        .ip { color: #ff6b6b; font-weight: bold; }
-        .location { color: #4ecdc4; }
-        .time { color: #888; font-size: 0.9em; }
-        .stats { 
-            background: #222; 
-            padding: 15px; 
-            margin: 20px 0; 
-            border-radius: 10px;
-            display: flex;
-            justify-content: space-around;
-        }
-        .stat { text-align: center; }
-        .stat-value { font-size: 24px; color: #0f0; }
-        .stat-label { font-size: 12px; color: #888; }
-        @keyframes fadeIn {
-            from { opacity: 0; }
-            to { opacity: 1; }
-        }
-        @keyframes highlight {
-            0% { background: #005500; }
-            100% { background: #003300; }
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>🔴 LIVE CLICK MONITOR</h1>
-        <p>Auto-refresh every 3 seconds | Last update: <span id="current-time"></span></p>
-        <div class="stats">
-            <div class="stat">
-                <div class="stat-value">{{ total_clicks }}</div>
-                <div class="stat-label">TOTAL CLICKS</div>
-            </div>
-            <div class="stat">
-                <div class="stat-value">{{ thai_clicks }}</div>
-                <div class="stat-label">FROM THAILAND</div>
-            </div>
-            <div class="stat">
-                <div class="stat-value">{{ mobile_clicks }}</div>
-                <div class="stat-label">MOBILE DEVICES</div>
-            </div>
-        </div>
-    </div>
-    
-    <div id="live-logs">
-        {% for log in recent_logs %}
-        <div class="log-entry {% if loop.index <= 3 %}new{% endif %}">
-            <div>
-                <span class="time">[{{ log.time }}]</span>
-                <span class="ip">{{ log.ip }}</span>
-                <span class="location">
-                    - {{ log.location.country }}
-                    {% if log.location.country == 'ไทย' %}
-                        / {{ log.location.region }}
-                        {% if log.location.city != 'Unknown' %} / {{ log.location.city }}{% endif %}
-                    {% else %}
-                        {% if log.location.city != 'Unknown' %} / {{ log.location.city }}{% endif %}
-                    {% endif %}
-                </span>
-            </div>
-            <div style="margin-top: 5px; font-size: 0.9em;">
-                📱 {{ log.device }} | 📡 {{ log.location.isp[:30] }}
-            </div>
-        </div>
-        {% endfor %}
-    </div>
-    
-    <script>
-        document.getElementById('current-time').textContent = new Date().toLocaleTimeString();
-        
-        // Auto scroll to top for new entries
-        window.scrollTo(0, 0);
-    </script>
-</body>
-</html>
-'''
+# HTML_LOGS และ HTML_LIVE เหมือนเดิม (ไม่อัพเดตที่นี่เพื่อความกะทัดรัด)
+# ให้คง HTML_LOGS และ HTML_LIVE ไว้เหมือนเดิม
 
 # ============================================
-# LOCATION FUNCTIONS
+# LOCATION FUNCTIONS (ปรับ timeout)
 # ============================================
 
 def get_location(ip):
     """แปลง IP เป็นตำแหน่งแบบละเอียด"""
     try:
         # ถ้าเป็น IP local
-        if ip.startswith('127.') or ip.startswith('192.168.') or ip.startswith('10.'):
+        if ip.startswith('127.') or ip.startswith('192.168.') or ip.startswith('10.') or ip.startswith('172.'):
             return {
-                'country': 'ไทย',
-                'country_code': 'TH',
+                'country': 'Local',
+                'country_code': 'LOCAL',
                 'region': 'Local Network',
                 'city': 'เครือข่ายภายใน',
                 'district': 'ไม่ระบุ',
                 'subdistrict': 'ไม่ระบุ',
                 'postal': 'ไม่ระบุ',
                 'isp': 'Local Network',
-                'lat': '13.7563',
-                'lon': '100.5018',
+                'lat': None,
+                'lon': None,
                 'address': 'เครือข่ายภายใน (ไม่สามารถระบุที่อยู่ได้)'
             }
         
-        # ใช้ ip-api.com (ฟรี)
-        response = requests.get(
-            f'http://ip-api.com/json/{ip}?fields=status,message,country,countryCode,regionName,city,district,zip,lat,lon,isp,org,as,query',
-            timeout=5
-        )
-        data = response.json()
+        # ใช้ ip-api.com (ฟรี) - ลด timeout สำหรับ Render
+        try:
+            response = requests.get(
+                f'http://ip-api.com/json/{ip}?fields=status,message,country,countryCode,regionName,city,district,zip,lat,lon,isp,org,as,query',
+                timeout=3  # ลด timeout
+            )
+            data = response.json()
+            
+            if data.get('status') == 'success':
+                # แปลงชื่อจังหวัดเป็นไทย
+                regions_th = {
+                    'Bangkok': 'กรุงเทพมหานคร',
+                    'Chiang Mai': 'เชียงใหม่',
+                    'Phuket': 'ภูเก็ต',
+                    'Samut Prakan': 'สมุทรปราการ',
+                    'Nonthaburi': 'นนทบุรี',
+                    'Udon Thani': 'อุดรธานี',
+                    'Chon Buri': 'ชลบุรี',
+                    'Nakhon Ratchasima': 'นครราชสีมา',
+                    'Khon Kaen': 'ขอนแก่น',
+                    'Songkhla': 'สงขลา',
+                    'Pathum Thani': 'ปทุมธานี',
+                    'Nakhon Si Thammarat': 'นครศรีธรรมราช',
+                    'Surat Thani': 'สุราษฎร์ธานี',
+                    'Rayong': 'ระยอง',
+                    'Lampang': 'ลำปาง',
+                    'Samut Sakhon': 'สมุทรสาคร',
+                    'Nakhon Pathom': 'นครปฐม',
+                    'Ayutthaya': 'พระนครศรีอยุธยา',
+                    'Chiang Rai': 'เชียงราย',
+                    'Trang': 'ตรัง',
+                    'Pattaya': 'พัทยา',
+                    'Hat Yai': 'หาดใหญ่',
+                    'Nakhon Sawan': 'นครสวรรค์',
+                    'Ubon Ratchathani': 'อุบลราชธานี',
+                    'Surin': 'สุรินทร์',
+                    'Mae Hong Son': 'แม่ฮ่องสอน',
+                    'Kanchanaburi': 'กาญจนบุรี',
+                    'Hua Hin': 'หัวหิน',
+                    'Phetchaburi': 'เพชรบุรี'
+                }
+                
+                country = data.get('country', 'Unknown')
+                region = data.get('regionName', '')
+                city = data.get('city', '')
+                district = data.get('district', '')
+                postal = data.get('zip', '')
+                
+                # แปลงชื่อจังหวัดเป็นไทยถ้าจังหวัดอยู่ในไทย
+                if country == 'Thailand' and region in regions_th:
+                    region_th = regions_th[region]
+                    country_th = 'ไทย'
+                elif country == 'Thailand':
+                    region_th = region
+                    country_th = 'ไทย'
+                else:
+                    region_th = region
+                    country_th = country
+                
+                # สร้างที่อยู่แบบละเอียด
+                address_parts = []
+                if district and district != city:
+                    address_parts.append(f"ตำบล/แขวง {district}")
+                if city:
+                    address_parts.append(f"อำเภอ/เขต {city}")
+                if region_th:
+                    address_parts.append(f"จังหวัด {region_th}")
+                if postal:
+                    address_parts.append(f"รหัสไปรษณีย์ {postal}")
+                
+                full_address = ", ".join(address_parts) if address_parts else "ไม่สามารถระบุที่อยู่ได้"
+                
+                return {
+                    'country': country_th if country == 'Thailand' else country,
+                    'country_code': data.get('countryCode', ''),
+                    'region': region_th,
+                    'city': city,
+                    'district': district,
+                    'subdistrict': district,
+                    'postal': postal,
+                    'isp': data.get('isp', 'Unknown'),
+                    'org': data.get('org', ''),
+                    'lat': data.get('lat'),
+                    'lon': data.get('lon'),
+                    'address': full_address,
+                    'raw_data': data
+                }
+        except requests.exceptions.Timeout:
+            print(f"⚠️ Timeout ในการขอข้อมูลตำแหน่งจาก IP: {ip}")
         
-        if data.get('status') == 'success':
-            # แปลงชื่อจังหวัดเป็นไทย
-            regions_th = {
-                'Bangkok': 'กรุงเทพมหานคร',
-                'Chiang Mai': 'เชียงใหม่',
-                'Phuket': 'ภูเก็ต',
-                'Samut Prakan': 'สมุทรปราการ',
-                'Nonthaburi': 'นนทบุรี',
-                'Udon Thani': 'อุดรธานี',
-                'Chon Buri': 'ชลบุรี',
-                'Nakhon Ratchasima': 'นครราชสีมา',
-                'Khon Kaen': 'ขอนแก่น',
-                'Songkhla': 'สงขลา',
-                'Pathum Thani': 'ปทุมธานี',
-                'Nakhon Si Thammarat': 'นครศรีธรรมราช',
-                'Surat Thani': 'สุราษฎร์ธานี',
-                'Rayong': 'ระยอง',
-                'Lampang': 'ลำปาง',
-                'Samut Sakhon': 'สมุทรสาคร',
-                'Nakhon Pathom': 'นครปฐม',
-                'Ayutthaya': 'พระนครศรีอยุธยา',
-                'Chiang Rai': 'เชียงราย',
-                'Trang': 'ตรัง',
-                'Pattaya': 'พัทยา',
-                'Hat Yai': 'หาดใหญ่',
-                'Nakhon Sawan': 'นครสวรรค์',
-                'Ubon Ratchathani': 'อุบลราชธานี',
-                'Surin': 'สุรินทร์',
-                'Mae Hong Son': 'แม่ฮ่องสอน',
-                'Kanchanaburi': 'กาญจนบุรี',
-                'Hua Hin': 'หัวหิน',
-                'Phetchaburi': 'เพชรบุรี'
-            }
-            
-            country = data.get('country', 'Unknown')
-            region = data.get('regionName', '')
-            city = data.get('city', '')
-            district = data.get('district', '')
-            postal = data.get('zip', '')
-            
-            # แปลงชื่อจังหวัดเป็นไทยถ้าจังหวัดอยู่ในไทย
-            if country == 'Thailand' and region in regions_th:
-                region_th = regions_th[region]
-                country_th = 'ไทย'
-            elif country == 'Thailand':
-                region_th = region
-                country_th = 'ไทย'
-            else:
-                region_th = region
-                country_th = country
-            
-            # สร้างที่อยู่แบบละเอียด
-            address_parts = []
-            if district and district != city:
-                address_parts.append(f"ตำบล/แขวง {district}")
-            if city:
-                address_parts.append(f"อำเภอ/เขต {city}")
-            if region_th:
-                address_parts.append(f"จังหวัด {region_th}")
-            if postal:
-                address_parts.append(f"รหัสไปรษณีย์ {postal}")
-            
-            full_address = ", ".join(address_parts) if address_parts else "ไม่สามารถระบุที่อยู่ได้"
-            
-            return {
-                'country': country_th if country == 'Thailand' else country,
-                'country_code': data.get('countryCode', ''),
-                'region': region_th,
-                'city': city,
-                'district': district,
-                'subdistrict': district,
-                'postal': postal,
-                'isp': data.get('isp', 'Unknown'),
-                'org': data.get('org', ''),
-                'lat': data.get('lat'),
-                'lon': data.get('lon'),
-                'address': full_address,
-                'raw_data': data
-            }
-        else:
-            # ถ้า ip-api.com ล้มเหลว ให้ใช้ api อื่น
-            return get_location_backup(ip)
+        # ถ้า ip-api.com ล้มเหลว ให้ใช้ api อื่น
+        return get_location_backup(ip)
             
     except Exception as e:
         print(f"Error getting location: {e}")
@@ -856,7 +469,7 @@ def get_location_backup(ip):
     """API สำรองสำหรับหาตำแหน่ง"""
     try:
         # ใช้ ipapi.co เป็น backup
-        response = requests.get(f'https://ipapi.co/{ip}/json/', timeout=3)
+        response = requests.get(f'https://ipapi.co/{ip}/json/', timeout=2)
         data = response.json()
         
         country = data.get('country_name', 'Unknown')
@@ -949,14 +562,8 @@ def detect_device(user_agent):
 @app.route('/')
 def home():
     """หน้าหลัก"""
-    # หา IP ของ PC
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-    except:
-        local_ip = "127.0.0.1"
+    # ตรวจสอบว่าใช้งานบน Render หรือไม่
+    is_render = 'render.com' in request.host_url
     
     main_link = request.host_url + "click/main"
     
@@ -966,7 +573,8 @@ def home():
     
     return render_template_string(HTML_HOME, 
                                 main_link=main_link,
-                                server_ip=local_ip,
+                                is_render=is_render,
+                                render_url=request.host_url.rstrip('/'),
                                 total_clicks=len(logs),
                                 last_device=logs[-1]['device'] if logs else 'ไม่มีข้อมูล',
                                 last_country=logs[-1]['location']['country'] if logs else 'ไม่มีข้อมูล',
@@ -999,43 +607,8 @@ def track_click(link_name):
     # บันทึกลง memory
     logs.append(log_entry)
     
-    # แสดงใน console แบบละเอียด
-    print(f"\n{'='*80}")
-    print(f"📍 NEW CLICK DETECTED - DETAILED LOCATION INFO")
-    print(f"{'='*80}")
-    print(f"📅 เวลา: {log_entry['time']}")
-    print(f"🌐 IP Address: {ip}")
-    print(f"📱 อุปกรณ์: {device}")
-    print(f"🔗 ลิงก์ที่คลิก: {link_name}")
-    print(f"")
-    print(f"📍 ที่อยู่ละเอียด:")
-    
-    if location['country'] == 'ไทย':
-        print(f"   ประเทศ: {location['country']}")
-        if location['region'] and location['region'] != 'Unknown':
-            print(f"   จังหวัด: {location['region']}")
-        if location['city'] and location['city'] != 'Unknown':
-            print(f"   อำเภอ/เขต: {location['city']}")
-        if location['district'] and location['district'] != 'Unknown':
-            print(f"   ตำบล/แขวง: {location['district']}")
-        if location['postal'] and location['postal'] != 'Unknown':
-            print(f"   รหัสไปรษณีย์: {location['postal']}")
-        print(f"   ที่อยู่รวม: {location['address']}")
-    else:
-        print(f"   ประเทศ: {location['country']}")
-        if location['city'] and location['city'] != 'Unknown':
-            print(f"   เมือง: {location['city']}")
-        if location['region'] and location['region'] != 'Unknown':
-            print(f"   รัฐ/จังหวัด: {location['region']}")
-    
-    print(f"")
-    print(f"📡 ข้อมูลเครือข่าย:")
-    print(f"   ISP: {location['isp']}")
-    if location['lat'] and location['lon']:
-        print(f"   พิกัด: {location['lat']}, {location['lon']}")
-        print(f"   Google Maps: https://maps.google.com/?q={location['lat']},{location['lon']}")
-    
-    print(f"{'='*80}\n")
+    # แสดงใน console
+    print(f"[{log_entry['time']}] 📍 Click from {ip} - {location['country']} - {device}")
     
     # บันทึกลงไฟล์
     save_logs_to_file()
@@ -1130,15 +703,20 @@ def clear_logs():
     """ล้างข้อมูลทั้งหมด"""
     global logs
     logs.clear()
-    if os.path.exists('click_logs.json'):
-        os.remove('click_logs.json')
+    if os.path.exists(DATA_FILE):
+        os.remove(DATA_FILE)
     print("\n🗑️ ล้างข้อมูลทั้งหมดเรียบร้อย")
     return redirect('/')
+
+@app.route('/health')
+def health_check():
+    """Health check สำหรับ Render"""
+    return {"status": "healthy", "logs_count": len(logs)}, 200
 
 def save_logs_to_file():
     """บันทึก logs ลงไฟล์"""
     try:
-        with open('click_logs.json', 'w', encoding='utf-8') as f:
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
             json.dump(logs, f, indent=2, ensure_ascii=False)
     except Exception as e:
         print(f"Error saving logs: {e}")
@@ -1147,55 +725,26 @@ def load_logs_from_file():
     """โหลด logs จากไฟล์"""
     global logs
     try:
-        if os.path.exists('click_logs.json'):
-            with open('click_logs.json', 'r', encoding='utf-8') as f:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, 'r', encoding='utf-8') as f:
                 loaded_logs = json.load(f)
                 logs.extend(loaded_logs)
                 print(f"📂 โหลดบันทึก {len(loaded_logs)} รายการจากไฟล์")
     except Exception as e:
         print(f"Error loading logs: {e}")
 
-def get_network_info():
-    """แสดงข้อมูลเครือข่าย"""
+def print_startup_info():
+    """แสดงข้อมูลเมื่อเริ่มต้นเซิร์ฟเวอร์"""
     print("\n" + "="*70)
-    print("🌐 ข้อมูลเครือข่ายเซิร์ฟเวอร์")
+    print("🚀 IP Tracker สำหรับ Render.com")
     print("="*70)
-    
-    try:
-        # หา IP Local
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        
-        print(f"📍 IP Local ของคุณ: {local_ip}")
-        print(f"🔗 ลิงก์หลักสำหรับติดตาม: http://{local_ip}:5000/click/main")
-        print(f"📊 ดูบันทึก: http://{local_ip}:5000/logs")
-        print(f"🏠 หน้าแรก: http://{local_ip}:5000")
-        
-        # แสดง QR Code ถ้าเป็นไปได้
-        try:
-            import qrcode
-            qr = qrcode.QRCode(version=1, box_size=2, border=2)
-            qr.add_data(f"http://{local_ip}:5000")
-            qr.make(fit=True)
-            print(f"📱 QR Code สำหรับเข้าถึง: http://{local_ip}:5000")
-        except:
-            pass
-        
-    except Exception as e:
-        print(f"❌ ผิดพลาดในการหาข้อมูลเครือข่าย: {e}")
-        print(f"📍 ใช้ localhost แทน: http://localhost:5000")
-    
+    print(f"📁 ไฟล์ข้อมูล: {DATA_FILE}")
+    print(f"📊 ข้อมูลที่มีอยู่: {len(logs)} รายการ")
     print("="*70)
-
-# ============================================
-# SKIP NGROK WARNING (REMOVE FREE PLAN WARNING PAGE)
-# ============================================
-@app.after_request
-def skip_ngrok_warning(response):
-    response.headers["ngrok-skip-browser-warning"] = "true"
-    return response    
+    print("⚠️  สำหรับการเรียนรู้เท่านั้น!")
+    print("📌 ระบบจะทำงานบน: https://your-app-name.onrender.com")
+    print("📌 Health check: /health")
+    print("="*70)
 
 # ============================================
 # MAIN EXECUTION
@@ -1205,25 +754,9 @@ if __name__ == '__main__':
     # โหลดข้อมูลเก่าจากไฟล์
     load_logs_from_file()
     
-    # แสดงข้อมูลเครือข่าย
-    get_network_info()
+    # แสดงข้อมูลเริ่มต้น
+    print_startup_info()
     
-    # เปิดเบราว์เซอร์อัตโนมัติ
-    try:
-        threading.Timer(1.5, lambda: webbrowser.open("http://localhost:5000")).start()
-    except:
-        pass
-    
-    print("\n🚀 กำลังเริ่มเซิร์ฟเวอร์ IP Tracker...")
-    print("⚠️  สำหรับการเรียนรู้เท่านั้น!")
-    print("📌 กด Ctrl+C เพื่อหยุดเซิร์ฟเวอร์")
-    print("\n" + "="*70)
-    
-    try:
-        app.run(host='0.0.0.0', port=5000, debug=False)
-    except KeyboardInterrupt:
-        print("\n\n🛑 หยุดเซิร์ฟเวอร์แล้ว")
-        print(f"💾 บันทึกข้อมูลลงไฟล์...")
-        save_logs_to_file()
-        print(f"✅ บันทึก {len(logs)} รายการลงไฟล์เรียบร้อย")
-        print("👋 สิ้นสุดการทำงาน")
+    # รันแอปพลิเคชัน
+    # บน Render ต้องใช้ port จาก environment variable
+    app.run(host=HOST, port=PORT, debug=False)

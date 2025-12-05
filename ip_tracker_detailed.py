@@ -958,7 +958,7 @@ def home():
     except:
         local_ip = "127.0.0.1"
     
-    main_link = f"http://{local_ip}:5000/click/main"
+    main_link = request.host_url + "click/main"
     
     # คำนวณสถิติ
     thai_count = sum(1 for log in logs if log['location']['country'] == 'ไทย')
